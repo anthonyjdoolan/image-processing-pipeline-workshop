@@ -6,6 +6,8 @@ This project does leverage the AWS Deep Learning Image: 763104351884.dkr.ecr.us-
 
 See [deep-learning-containers/available_images.md](https://github.com/aws/deep-learning-containers/blob/master/available_images.md) for more information.
 
+Data in the templates, both SAM and Cloud formation has been somewhat anonymized and will not work via copy and paste. These are meant to be used to help guide the creation of these services.
+
 ## Project Structure
 - `aws/`: Contains AWS-specific configurations and code.
   - `event-bridge/`: Example cloudformation template.
