@@ -63,3 +63,107 @@ class PipelineStack(cdk.Stack):
             ],
         ))
         endpoint_arn = self.format_arn(service="sagemaker", resource="endpoint", resource_name=endpoint_name)
+        # -----------------------------------------------------------
+        # Step Functions state machine
+        # -----------------------------------------------------------
+        read_input = sfn_tasks.CallAwsService(
+            self, "ReadInputJSON",
+            service="s3", action="getObject",
+            parameters={
+                "Bucket": sfn.JsonPath.string_at("$.detail.bucket.name"),
+                "Key": sfn.JsonPath.string_at("$.detail.object.key"),
+            },
+            iam_resources=[bucket.arn_for_objects("inputs/*")],
+            result_path="$.s3Object",
+            result_selector={"Body.$": "$.Body", "ParsedBody.$": "States.StringToJson($.Body)"},
+        )
+
+        parse_input = sfn.Pass(
+            self, "ParseInputJSON",
+            parameters={
+                "bucket.$": "$.detail.bucket.name",
+                "before_image.$": "States.Format('s3://{}/images/{}', $.detail.bucket.name, $.s3Object.ParsedBody.before)",
+                "after_image.$": "States.Format('s3://{}/images/{}', $.detail.bucket.name, $.s3Object.ParsedBody.after)",
+                "compared_output.$": "States.Format('s3://{}/compared/{}', $.detail.bucket.name, $.s3Object.ParsedBody.compared_output)",
+                "text": "house, building, roof",
+                "payloadKey.$": "States.Format('payload/{}.json', States.UUID())",
+            },
+        )
+
+        create_payload = sfn_tasks.CallAwsService(
+            self, "CreatePayload",
+            service="s3", action="putObject",
+            parameters={
+                "Body.$": "$", "Bucket.$": "$.bucket",
+                "Key.$": "$.payloadKey", "ContentType": "application/json",
+            },
+            iam_resources=[bucket.arn_for_objects("payload/*")],
+            result_path="$.payloadFile",
+        )
+
+        call_sagemaker = sfn_tasks.CallAwsService(
+            self, "CallSAM3",
+            service="sagemakerruntime", action="invokeEndpointAsync",
+            parameters={
+                "EndpointName": endpoint_name,
+                "InputLocation.$": "States.Format('s3://{}/{}', $.bucket, $.payloadKey)",
+                "ContentType": "application/json",
+            },
+            iam_resources=[endpoint_arn],
+            iam_action="sagemaker:InvokeEndpointAsync",
+        )
+
+        process_image = sfn_tasks.LambdaInvoke(
+            self, "ProcessImage",
+            lambda_function=processor,
+            payload=sfn.TaskInput.from_object({
+                "bucket": sfn.JsonPath.string_at("$.detail.bucket.name"),
+                "key": sfn.JsonPath.string_at("$.detail.object.key"),
+            }),
+        )
+
+        # Route based on S3 key pattern
+        router = sfn.Choice(self, "CheckInputFormat")
+        router.when(
+            sfn.Condition.string_matches("$.detail.object.key", "inputs/*.json"),
+            read_input.next(parse_input).next(create_payload).next(call_sagemaker),
+        )
+        router.when(
+            sfn.Condition.and_(
+                sfn.Condition.string_matches("$.detail.object.key", "async-out/*"),
+                sfn.Condition.string_matches("$.detail.object.key", "*.out"),
+            ),
+            process_image,
+        )
+        router.otherwise(sfn.Pass(self, "UnmatchedKeyPattern"))
+
+        state_machine = sfn.StateMachine(
+            self, "ImagePipelineStateMachine",
+            state_machine_name=f"{prefix}-image-pipeline",
+            definition_body=sfn.DefinitionBody.from_chainable(router),
+            state_machine_type=sfn.StateMachineType.STANDARD,
+            logs=sfn.LogOptions(
+                destination=logs.LogGroup(self, "StateMachineLogGroup",
+                    log_group_name=f"/aws/vendedlogs/states/{prefix}-image-pipeline",
+                    removal_policy=cdk.RemovalPolicy.DESTROY),
+                level=sfn.LogLevel.ALL, include_execution_data=False,
+            ),
+        )
+
+        # EventBridge rule - triggers on S3 ObjectCreated events
+        events.Rule(
+            self, "S3ObjectCreatedRule",
+            rule_name=f"{prefix}-s3-pipeline-trigger",
+            event_pattern=events.EventPattern(
+                source=["aws.s3"],
+                detail_type=["Object Created"],
+                detail={
+                    "bucket": {"name": [bucket_name]},
+                    "object": {"key": [
+                        {"wildcard": "inputs/*.json"},
+                        {"wildcard": "async-out/*.out"},
+                    ]},
+                },
+            ),
+            targets=[events_targets.SfnStateMachine(state_machine)],
+        )
