@@ -1,36 +1,132 @@
 # OARC Image Processing Pipeline Workshop
 
-This repository contains the code and configuration for an image processing pipeline using AWS services, including Lambda, Step Functions, S3, and SageMaker.
+Serverless ML pipeline for analyzing before/after satellite imagery using AWS services. Designed as a workshop for UCLA OARC demonstrating serverless ML workflows.
 
-This project does leverage the AWS Deep Learning Image: 763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-inference:2.6.0-gpu-py312-cu124-ubuntu22.04-sagemaker. This is an image provided by AWS that is able to run the model and inference code, and provides hooks that we can leverage so we don't need to create the api routes for invoke endpoint and health.
+## What It Does
 
-See [deep-learning-containers/available_images.md](https://github.com/aws/deep-learning-containers/blob/master/available_images.md) for more information.
+1. Accepts before/after satellite image pairs via S3 JSON inputs
+2. Uses SAM3 (Segment Anything Model 3) on SageMaker for object segmentation
+3. Compares images to identify changes (red = destroyed, green = survived)
+4. Uses Claude Opus 4.5 via Bedrock to analyze comparison images
+5. Produces styled markdown reports saved to S3
 
-Data in the templates, both SAM and Cloud formation has been somewhat anonymized and will not work via copy and paste. These are meant to be used to help guide the creation of these services.
+## Configuration
+
+All settings are in `cdk.json`. Edit this file before deploying:
+
+```json
+{
+  "context": {
+    "region": "us-west-2",
+    "bucket_name": "oarc-ws-image-processing-pipeline",
+    "endpoint_name": "oarc-ws-sam3-endpoint",
+    ...
+  }
+}
+```
+
+Scripts in `scripts/` automatically read from `cdk.json` — no other config needed.
+
+## Quick Start
+
+### Prerequisites
+
+```bash
+# Install AWS CDK CLI (if not already installed)
+npm install -g aws-cdk
+
+# Bootstrap your AWS account for CDK (one-time setup per account/region)
+cdk bootstrap aws://ACCOUNT-ID/us-west-2
+```
+
+### Deploy
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Authenticate Docker to AWS Deep Learning Containers ECR registry
+# 763104351884 is AWS's official account ID for Deep Learning Container images
+# Required to pull the PyTorch SageMaker base image during CDK deployment
+# See: https://aws.github.io/deep-learning-containers/reference/available_images/#pytorch-inference
+aws ecr get-login-password --region us-west-2 | \
+  docker login --username AWS --password-stdin 763104351884.dkr.ecr.us-west-2.amazonaws.com
+
+# Deploy infrastructure (OarcWsStorageStack + OarcWsPipelineStack)
+# This builds and deploys Lambda functions and SageMaker model container
+cdk deploy --all
+
+# Start SageMaker endpoint (costs ~$0.736/hr)
+python scripts/deploy_endpoint.py create
+
+# Trigger the pipeline and watch for results
+python scripts/run_pipeline.py
+
+# Check endpoint status, cost, and auto-shutdown timer
+python scripts/deploy_endpoint.py status
+
+# Clean up when done
+python scripts/deploy_endpoint.py delete
+cdk destroy --all
+```
 
 ## Project Structure
-- `aws/`: Contains AWS-specific configurations and code.
-  - `event-bridge/`: Example cloudformation template.
-  - `lambda/`: AWS Lambda function code and example SAM template.
-    - `scripts/`: Helper code to create/update layers, update function code.
-  - `step-functions/`: Example cloudformation template.
-  - `s3/`:
-    - `files/`: S3 bucket example images & json, along with the model.
-    - `scripts/`: Deletes everything in the s3 bucket and re uploads model and example files.
-- `model/`: Model inference code with requirements and model config/safetensors.
-- `scripts/`: Utility scripts for testing and deployment.
-  - `sagemaker/`: Scripts to create the model, endpoint config, and endpoint.
-  - `tests/`: Some helpful test scripts to trigger the workflow.
 
-## Setup Instructions
-1. **AWS Console**: You will need to create the s3 bucket, as well as the shell for the lambda function. The cloud formation templates were created to help guide your creation of these services and not meant to create the services for you. IAM roles/policies will need to be created for all of these services.
+```
+stacks/
+  storage_stack.py        # S3 bucket (persists across pipeline redeployments)
+  pipeline_stack.py       # Lambda, Step Functions, EventBridge, monitoring
+  lambda_functions/       # Processor and endpoint monitor Lambda code (Docker)
+  sagemaker/sam3/         # SageMaker SAM3 model container (Docker, 3.4GB)
+scripts/
+  config.py               # Reads config from cdk.json (do not edit)
+  deploy_endpoint.py      # Create/delete/status SageMaker endpoint
+  run_pipeline.py         # Upload test inputs and watch for results
+files/
+  images/                 # Sample before/after satellite images
+  inputs/                 # Sample JSON input files (1.json, 2.json, 3.json)
+  reports/                # Generated markdown reports (output)
+diagrams/                 # Architecture diagrams and documentation
+```
 
-2. **AWS Configuration**: Ensure you have AWS CLI configured with the necessary permissions to create and manage Lambda functions, Step Functions, and S3 buckets.
+## Architecture
 
-3. **S3 Bucket**: Create an S3 bucket to store input and output files. Update the bucket name in the scripts as needed.
+See [Architecture Documentation](diagrams/ARCHITECTURE.md) for detailed diagrams.
 
-4. **Deploy Lambda Function**: Deploy the Lambda function using the AWS Management Console. Consult the SAM template `aws/lambda/template.yml` and function code `aws/lambda/lambda_function.py` for reference.
+```
+S3 Upload → EventBridge → Step Functions → SageMaker (async) → Lambda → Bedrock → S3 Report
+```
 
-5. **Configure Step Functions**: Deploy the Step Functions state machine using the AWS Management Console. See the Cloud Formation template `aws/step-functions/template.json` for reference.
+**Event-driven workflow:**
+1. User uploads JSON to S3 `inputs/` → EventBridge detects ObjectCreated event
+2. Step Functions reads JSON, creates payload, invokes SageMaker async endpoint
+3. SageMaker processes images with SAM3, writes comparison to S3 `compared/`
+4. SageMaker writes output to S3 `async-out/` → triggers EventBridge again
+5. Step Functions invokes Lambda processor
+6. Lambda reads comparison image, calls Bedrock Claude for analysis
+7. Lambda generates styled markdown report, saves to S3 `markdown/`
 
-6. **Upload Input Files**: Place your input JSON files in the designated S3 bucket `inputs/` folder to trigger the processing pipeline or use/alter the helper script `scripts/tests/trigger-processing.sh`.
+## Cost Protection
+
+The SageMaker endpoint costs ~$0.736/hr (~$530/month if left running). Three safeguards:
+
+1. **Auto-shutdown** after 1 hour of inactivity (CloudWatch alarm on `InvocationsProcessed`)
+2. **Daily cleanup** at 2 AM UTC (EventBridge schedule)
+3. **Cost warnings** displayed after every `cdk deploy`
+
+Check status anytime:
+```bash
+python scripts/deploy_endpoint.py status
+```
+
+## AWS Services Used
+
+| Service | Purpose |
+|---------|---------|
+| S3 | Storage for images, model, and outputs |
+| Lambda | Post-processing (Bedrock + report generation) |
+| Step Functions | Workflow orchestration |
+| SageMaker | ML inference (SAM3 async endpoint) |
+| Bedrock | LLM analysis (Claude Opus 4.5) |
+| EventBridge | S3 event routing + scheduled cleanup |
+| CloudWatch | Endpoint monitoring + auto-shutdown alarm |
