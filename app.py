@@ -11,12 +11,18 @@ Destroy all:   cdk destroy --all
 """
 import aws_cdk as cdk
 from stacks.storage_stack import StorageStack
+from stacks.pipeline_stack import PipelineStack
 
 app = cdk.App()
 
 storage = StorageStack(app, "OarcWsStorageStack",
                        description="OARC Image Pipeline - S3 bucket for pipeline data")
 
+pipeline = PipelineStack(app, "OarcWsPipelineStack",
+                         bucket=storage.bucket,
+                         description="OARC Image Pipeline - Lambda, Step Functions, EventBridge, monitoring")
+
+pipeline.add_dependency(storage)
 tags: dict = app.node.try_get_context("tags") or {}
 for tag_key, tag_value in tags.items():
     cdk.Tags.of(app).add(tag_key, tag_value)
