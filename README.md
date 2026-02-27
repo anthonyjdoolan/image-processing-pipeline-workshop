@@ -56,7 +56,7 @@ aws ecr get-login-password --region us-west-2 | \
 # This builds and deploys Lambda functions and SageMaker model container
 cdk deploy --all
 
-# Start SageMaker endpoint (costs ~$0.736/hr)
+# Start SageMaker endpoint (costs $0.736/hr)
 python scripts/deploy_endpoint.py create
 
 # Trigger the pipeline and watch for results
@@ -91,8 +91,6 @@ diagrams/                 # Architecture diagrams and documentation
 
 ## Architecture
 
-See [Architecture Documentation](diagrams/ARCHITECTURE.md) for detailed diagrams.
-
 ```
 S3 Upload → EventBridge → Step Functions → SageMaker (async) → Lambda → Bedrock → S3 Report
 ```
@@ -108,7 +106,7 @@ S3 Upload → EventBridge → Step Functions → SageMaker (async) → Lambda �
 
 ## Cost Protection
 
-The SageMaker endpoint costs ~$0.736/hr (~$530/month if left running). Three safeguards:
+The SageMaker endpoint costs $0.736/hr ($530/month if left running). Three safeguards:
 
 1. **Auto-shutdown** after 1 hour of inactivity (CloudWatch alarm on `InvocationsProcessed`)
 2. **Daily cleanup** at 2 AM UTC (EventBridge schedule)
